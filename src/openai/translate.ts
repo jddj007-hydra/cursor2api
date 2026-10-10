@@ -7,7 +7,7 @@
  * a `system` role entry. Set CURSOR_DIRECT_SYSTEM_AS_HISTORY=false to send the
  * system role verbatim instead.
  */
-import type { McpToolDefinition } from "../cursor/session.js";
+import { MCP_PROVIDER, type McpToolDefinition } from "../cursor/session.js";
 import type { Config } from "../config.js";
 
 export interface OpenAIToolCall {
@@ -16,13 +16,33 @@ export interface OpenAIToolCall {
   function: { name: string; arguments: string };
 }
 
+export interface OpenAIContentPart {
+  type?: string;
+  text?: string;
+  image_url?: string | { url?: string };
+  url?: string;
+  source?: { type?: string; media_type?: string; data?: string };
+}
+
 export interface OpenAIMessage {
   role: "system" | "developer" | "user" | "assistant" | "tool";
-  content?: string | Array<{ type?: string; text?: string }> | null;
+  content?: string | Array<OpenAIContentPart | string> | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
   name?: string;
 }
+
+/** Raster image extracted from an OpenAI/Anthropic content part. */
+export interface InlineImage {
+  mimeType: string;
+  data: Buffer;
+  path: string;
+  width?: number;
+  height?: number;
+}
+
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGES = 8;
 
 export interface OpenAIChatRequest {
   model?: string;
@@ -30,11 +50,15 @@ export interface OpenAIChatRequest {
   stream?: boolean;
   tools?: Array<{ type?: string; function?: { name?: string; description?: string; parameters?: unknown } }>;
   tool_choice?: unknown;
+  reasoning_effort?: string;
+  reasoning?: { effort?: string };
 }
 
 export interface TurnInput {
   rootMessages: unknown[];
   userText: string;
+  /** Images on the active user turn. Cursor sees these as selected_images. */
+  images: InlineImage[];
   tools: McpToolDefinition[];
 }
 
@@ -58,6 +82,118 @@ export function textOf(content: OpenAIMessage["content"]): string {
       .join("\n");
   }
   return "";
+}
+
+/**
+ * Pull inline raster images out of a content array.
+ * Accepts OpenAI `image_url` (string or `{url}`) and Anthropic `source.base64`.
+ * Remote http(s) URLs are left behind: Cursor's selected_images field wants bytes.
+ */
+export function imagesOf(content: OpenAIMessage["content"]): InlineImage[] {
+  if (!Array.isArray(content)) return [];
+  const out: InlineImage[] = [];
+  for (const part of content) {
+    if (typeof part === "string") continue;
+    const image = imageFromPart(part);
+    if (!image) continue;
+    out.push({ ...image, path: imagePath(image.mimeType, out.length) });
+    if (out.length >= MAX_IMAGES) break;
+  }
+  return out;
+}
+
+function imageFromPart(part: OpenAIContentPart | undefined): Omit<InlineImage, "path"> | undefined {
+  if (!part) return;
+  const type = part.type ?? "";
+  if (type !== "image_url" && type !== "input_image" && type !== "image") return;
+  const uri = imageUriOf(part);
+  if (!uri) return;
+  return decodeDataImage(uri);
+}
+
+function imageUriOf(part: OpenAIContentPart): string {
+  const direct = part.image_url ?? part.url;
+  if (typeof direct === "string") return direct;
+  if (direct && typeof direct.url === "string") return direct.url;
+  const source = part.source;
+  if (source?.type === "base64" && source.data) {
+    return `data:${source.media_type || "image/png"};base64,${source.data}`;
+  }
+  return "";
+}
+
+function decodeDataImage(uri: string): Omit<InlineImage, "path"> | undefined {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(uri.trim());
+  if (!match) return;
+  const mimeType = match[1]!.toLowerCase() === "image/jpg" ? "image/jpeg" : match[1]!.toLowerCase();
+  if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mimeType)) return;
+  let data: Buffer;
+  try {
+    data = Buffer.from(match[2]!.replace(/\s/g, ""), "base64");
+  } catch {
+    return;
+  }
+  if (data.length === 0 || data.length > MAX_IMAGE_BYTES) return;
+  const size = imageSize(data, mimeType);
+  return { mimeType, data, ...size };
+}
+
+function imagePath(mimeType: string, index: number): string {
+  const ext = mimeType === "image/jpeg" ? "jpg" : mimeType.slice("image/".length);
+  return index === 0 ? `image.${ext}` : `image-${index + 1}.${ext}`;
+}
+
+function imageSize(data: Buffer, mimeType: string): { width?: number; height?: number } {
+  if (mimeType === "image/png" && data.length >= 24 && data[0] === 0x89 && data.toString("ascii", 1, 4) === "PNG") {
+    return { width: data.readUInt32BE(16), height: data.readUInt32BE(20) };
+  }
+  if (mimeType === "image/gif" && data.length >= 10 && data.toString("ascii", 0, 3) === "GIF") {
+    return { width: data.readUInt16LE(6), height: data.readUInt16LE(8) };
+  }
+  if (mimeType === "image/jpeg") {
+    let i = 2;
+    while (i + 9 < data.length) {
+      if (data[i] !== 0xff) {
+        i += 1;
+        continue;
+      }
+      const marker = data[i + 1]!;
+      if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+        return { height: data.readUInt16BE(i + 5), width: data.readUInt16BE(i + 7) };
+      }
+      const len = data.readUInt16BE(i + 2);
+      if (len < 2) break;
+      i += 2 + len;
+    }
+  }
+  return {};
+}
+
+const HANDBACK_PROSE =
+  /回一句|工具通道|被掐断|bash\s*通道|工具调用又|工具调用失败|没有发出去|没跑成|没有执行成功|没能跑起来|工具当前不可用|Shell\s*工具[^。\n]{0,24}不可用|tool is unavailable|tools are unavailable|tool not available|shell tool is failing|shell tool is unavailable/i;
+
+/** Model gave up and handed the turn back to the user instead of calling the next tool. */
+export function isToolHandback(text: string): boolean {
+  return HANDBACK_PROSE.test(text);
+}
+
+/**
+ * Drop sentences that claim the tool channel died. Those lines are the model
+ * copying an earlier stop; the tool result in the same history is the real outcome.
+ * Leaving them in makes the next turn repeat "bash 被掐断" and refuse to call bash.
+ */
+export function stripHandbackProse(text: string): string {
+  const kept = text
+    .split("\n")
+    .map((line) =>
+      line
+        .split(/(?<=[。！？])|(?<=\.)\s+/)
+        .filter((sentence) => sentence.trim() && !HANDBACK_PROSE.test(sentence))
+        .join("")
+        .trim(),
+    )
+    .filter((line) => line);
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export function buildTurnInput(body: OpenAIChatRequest, config: Config): TurnInput {
@@ -104,7 +240,7 @@ export function buildTurnInput(body: OpenAIChatRequest, config: Config): TurnInp
 
     if (msg.role === "assistant") {
       const parts: unknown[] = [];
-      const text = textOf(msg.content);
+      const text = stripHandbackProse(textOf(msg.content));
       if (text) parts.push({ type: "text", text });
       for (const call of msg.tool_calls ?? []) {
         parts.push({
@@ -146,8 +282,9 @@ export function buildTurnInput(body: OpenAIChatRequest, config: Config): TurnInp
       : endsOnToolResult
         ? config.continuationPrompt
         : "";
+  const images = activeIndex >= 0 ? imagesOf(messages[activeIndex]?.content) : [];
 
-  return { rootMessages, userText, tools: buildTools(body.tools) };
+  return { rootMessages, userText, images, tools: buildTools(body.tools) };
 }
 
 function parseArgs(raw: string | undefined): unknown {
@@ -169,7 +306,7 @@ export function buildTools(tools: OpenAIChatRequest["tools"]): McpToolDefinition
     out.push({
       name,
       toolName: name,
-      providerIdentifier: "openai",
+      providerIdentifier: MCP_PROVIDER,
       description: fn?.description ?? "",
       inputSchemaJson: JSON.stringify(fn?.parameters ?? { type: "object", properties: {} }),
     });

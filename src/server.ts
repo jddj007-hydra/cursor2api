@@ -9,9 +9,9 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { Config } from "./config.js";
 import type { AccountPool } from "./auth.js";
-import { listModelIds, toModelList, upstreamId } from "./models.js";
+import { applyRequestedEffort, listModelIds, toModelList, upstreamId } from "./models.js";
 import { runTurn, type TurnEvent } from "./cursor/session.js";
-import { buildTurnInput, type OpenAIChatRequest } from "./openai/translate.js";
+import { buildTurnInput, isToolHandback, stripHandbackProse, type OpenAIChatRequest } from "./openai/translate.js";
 
 export interface ServerDeps {
   config: Config;
@@ -84,32 +84,100 @@ async function chatCompletions(
   const account = await pool.next();
   const known = await listModelIds(account.accessToken, config);
   const clientModel = body.model ?? `${config.modelPrefix}auto`;
-  const model = upstreamId(clientModel, config.modelPrefix, known);
+  const effort = body.reasoning_effort ?? body.reasoning?.effort;
+  const model = applyRequestedEffort(
+    upstreamId(clientModel, config.modelPrefix, known),
+    effort,
+    known,
+    config.effortFromRequestModels,
+    config.modelPrefix,
+  );
   const input = buildTurnInput(body, config);
 
   if (config.logRequests) {
     log(
       `chat account=${account.label} model=${model} history=${input.rootMessages.length} ` +
         `tools=${input.tools.length} stream=${Boolean(body.stream)} ` +
-        `action=${input.userText.trim() ? "user" : "resume"}`,
+        `effort=${effort ?? "-"} ` +
+        `images=${input.images.length} ` +
+        `action=${input.userText.trim() || input.images.length > 0 ? "user" : "resume"}`,
     );
   }
 
   const abort = new AbortController();
   req.on("close", () => abort.abort());
 
-  const events = runTurn({
-    token: account.accessToken,
-    model,
-    rootMessages: input.rootMessages,
-    userText: input.userText,
-    tools: input.tools,
-    config,
-    signal: abort.signal,
-  });
+  const run = (userText: string) =>
+    runTurn({
+      token: account.accessToken,
+      model,
+      rootMessages: input.rootMessages,
+      userText,
+      images: input.images,
+      tools: input.tools,
+      config,
+      signal: abort.signal,
+    });
+
+  const endsOnTool = (body.messages ?? []).at(-1)?.role === "tool";
+  let events: AsyncGenerator<TurnEvent>;
+  if (!endsOnTool) {
+    events = stripStream(run(input.userText));
+  } else {
+    // Buffer the follow-up. Grok often spends this turn telling the user the
+    // bash channel was cut, then stops. Retry once before that text is streamed.
+    const first = await collect(run(input.userText));
+    const noCall = first.toolCalls.length === 0 && first.reason !== "error";
+    const handback = noCall && (isToolHandback(first.text) || stripHandbackProse(first.text) === "");
+    let chosen = first;
+    if (handback) {
+      log("continuation handed back without a tool call; retrying");
+      const second = await collect(run("Call the next tool immediately. Do not reply to the user."));
+      const secondActs = second.toolCalls.length > 0 || second.reason === "error";
+      chosen = secondActs ? second : richer(first, second);
+    }
+    events = stripStream(replay(chosen));
+  }
 
   if (body.stream) await streamResponse(res, events, clientModel, deps, account.label);
   else await bufferResponse(res, events, clientModel, deps, account.label);
+}
+
+function richer(a: Collected, b: Collected): Collected {
+  return stripHandbackProse(b.text).length >= stripHandbackProse(a.text).length ? b : a;
+}
+
+/** Hold the turn, then drop sentences that claim bash was cut. Tool calls stay. */
+async function* stripStream(events: AsyncGenerator<TurnEvent>): AsyncGenerator<TurnEvent> {
+  let text = "";
+  let thinking = "";
+  const rest: TurnEvent[] = [];
+  for await (const ev of events) {
+    if (ev.type === "thinking") {
+      thinking += ev.delta;
+      continue;
+    }
+    if (ev.type === "text") {
+      text += ev.delta;
+      continue;
+    }
+    rest.push(ev);
+  }
+  const cleanedThinking = stripHandbackProse(thinking);
+  if (cleanedThinking) yield { type: "thinking", delta: cleanedThinking };
+  const cleaned = stripHandbackProse(text);
+  if (cleaned) yield { type: "text", delta: cleaned };
+  for (const ev of rest) yield ev;
+}
+
+async function* replay(result: Collected): AsyncGenerator<TurnEvent> {
+  if (result.reasoning) yield { type: "thinking", delta: result.reasoning };
+  if (result.text) yield { type: "text", delta: result.text };
+  for (const call of result.toolCalls) yield { type: "tool_call", id: call.id, name: call.name, args: call.args };
+  if (result.usage.inputTokens !== undefined || result.usage.outputTokens !== undefined) {
+    yield { type: "usage", inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens };
+  }
+  yield { type: "done", reason: result.reason, error: result.error, code: result.code };
 }
 
 const OPENAI_TOOL_TYPE = "function" as const;

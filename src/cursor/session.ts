@@ -39,6 +39,14 @@ export type TurnEvent =
   | { type: "usage"; inputTokens?: number; outputTokens?: number }
   | { type: "done"; reason: "stop" | "tool_calls" | "error"; error?: string; code?: string };
 
+export interface TurnImage {
+  mimeType: string;
+  data: Buffer;
+  path: string;
+  width?: number;
+  height?: number;
+}
+
 export interface RunTurnOptions {
   token: string;
   model: string;
@@ -46,9 +54,30 @@ export interface RunTurnOptions {
   rootMessages: unknown[];
   /** The active user message text. */
   userText: string;
+  /** Inline images attached to the active user message. */
+  images?: TurnImage[];
   tools: McpToolDefinition[];
   config: Config;
   signal?: AbortSignal;
+}
+
+/** Cursor UserMessage, including selected_images when the caller attached any. */
+export function buildUserMessage(text: string, images: TurnImage[] | undefined, messageId: string): Record<string, unknown> {
+  const userMessage: Record<string, unknown> = { text, messageId };
+  if (!images || images.length === 0) return userMessage;
+  userMessage.selectedContext = {
+    selectedImages: images.map((img) => {
+      const selected: Record<string, unknown> = {
+        uuid: randomUUID(),
+        path: img.path,
+        mimeType: img.mimeType,
+        data: img.data,
+      };
+      if (img.width && img.height) selected.dimension = { width: img.width, height: img.height };
+      return selected;
+    }),
+  };
+  return userMessage;
 }
 
 /**
@@ -70,6 +99,12 @@ function connectCodeForHttp(status: number): string | undefined {
   if (status === 403) return "permission_denied";
   return undefined;
 }
+
+/** providerIdentifier stamped on caller tools; also the name of the one MCP "server" we report. */
+export const MCP_PROVIDER = "openai";
+
+/** ExecServerMessage fields that are not part of its `message` oneof. */
+const EXEC_ENVELOPE_FIELDS = new Set(["id", "execId", "spanContext", "acceptHookAdditionalContexts"]);
 
 const FLAG_COMPRESSED = 0x01;
 const FLAG_END_STREAM = 0x02;
@@ -114,9 +149,10 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
     // caller is mid-agent-loop (its last message is a tool result, so there is no
     // new user text) the server expects `resumeAction` instead — sending an empty
     // user message there makes the model answer the void.
-    action: opts.userText.trim()
-      ? { userMessageAction: { userMessage: { text: opts.userText, messageId: randomUUID() } } }
-      : { resumeAction: {} },
+    action:
+      opts.userText.trim() || (opts.images?.length ?? 0) > 0
+        ? { userMessageAction: { userMessage: buildUserMessage(opts.userText, opts.images, randomUUID()) } }
+        : { resumeAction: {} },
     modelDetails: { modelId: opts.model, displayModelId: opts.model, displayName: opts.model },
     requestedModel: { modelId: opts.model },
     conversationId: randomUUID(),
@@ -143,6 +179,9 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
   const client = await connectH2(config.cursorBaseUrl, config.proxyUrl);
   const req = client.request(headers);
 
+  const declaredTools = new Set(opts.tools.map((t) => t.name));
+  let reportedOutputTokens = 0;
+
   // http2 callbacks feed this queue; the generator body drains it.
   const queue: TurnEvent[] = [];
   let notify: (() => void) | null = null;
@@ -163,6 +202,14 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
     if (req.closed || req.destroyed) return;
     req.write(connectFrame(AgentClientMessage.encode(AgentClientMessage.create(message)).finish()));
   };
+  const sendExec = (ex: Record<string, any>, result: Record<string, unknown>): void =>
+    send({
+      execClientMessage: {
+        id: ex.id,
+        ...(ex.execId !== undefined ? { execId: ex.execId } : {}),
+        ...result,
+      },
+    });
 
   const decode = (payload: Buffer): Record<string, any> =>
     AgentServerMessage.toObject(AgentServerMessage.decode(payload), {
@@ -251,31 +298,67 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
       if (ex.requestContextArgs) {
         // Deliberately minimal: no rules, no repo info, no project layout. The only
         // thing advertised is the caller's tool set.
-        send({
-          execClientMessage: {
-            id: ex.id,
-            ...(ex.execId !== undefined ? { execId: ex.execId } : {}),
-            requestContextResult: {
-              success: {
-                requestContext: {
-                  rules: [],
-                  tools: opts.tools,
-                  env: {
-                    osVersion: "linux",
-                    workspacePaths: [],
-                    shell: "bash",
-                    sandboxEnabled: false,
-                    timeZone: "UTC",
-                  },
-                  repositoryInfo: [],
-                  gitRepos: [],
-                  projectLayouts: [],
-                  mcpInstructions: [],
+        sendExec(ex, {
+          requestContextResult: {
+            success: {
+              requestContext: {
+                rules: [],
+                tools: opts.tools,
+                env: {
+                  osVersion: "linux",
+                  workspacePaths: [],
+                  shell: "bash",
+                  sandboxEnabled: false,
+                  timeZone: "UTC",
                 },
+                repositoryInfo: [],
+                gitRepos: [],
+                projectLayouts: [],
+                mcpInstructions: [],
               },
             },
           },
         });
+        return;
+      }
+      if (ex.mcpStateExecArgs) {
+        // The server's GET_MCP_TOOLS tool reads the tool list back from the client.
+        // The caller's declared tools are the only "server" we have.
+        sendExec(ex, {
+          mcpStateExecResult: {
+            success: {
+              servers: [
+                {
+                  serverName: MCP_PROVIDER,
+                  serverIdentifier: MCP_PROVIDER,
+                  tools: opts.tools,
+                  instructions: [],
+                  status: "connected",
+                },
+              ],
+            },
+          },
+        });
+        return;
+      }
+      if (ex.mcpAllowlistPrecheckArgs) {
+        sendExec(ex, { mcpAllowlistPrecheckResult: { allowlisted: true } });
+        return;
+      }
+      if (ex.shellAllowlistPrecheckArgs) {
+        sendExec(ex, { shellAllowlistPrecheckResult: { allowlisted: true } });
+        return;
+      }
+      const native = nativeToolCallFromExec(ex);
+      if (native) {
+        push({
+          type: "tool_call",
+          id: safeToolCallId(native.id),
+          name: declaredName(native.name, native.aliases, declaredTools),
+          args: native.args,
+        });
+        // Same as mcp_args: the caller runs the tool and replays the result.
+        end({ type: "done", reason: "tool_calls" });
         return;
       }
       if (ex.mcpArgs) {
@@ -285,12 +368,33 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
         push({
           type: "tool_call",
           id: safeToolCallId(a.toolCallId),
-          name: String(a.name ?? a.toolName ?? "unknown"),
+          name: callerToolName(a, declaredTools),
           args,
         });
         // Hand control back to the caller — it owns tool execution.
         end({ type: "done", reason: "tool_calls" });
+        return;
       }
+      // Any other exec request is a native Cursor tool the caller cannot run. The
+      // server would wait for a result until the deadline, so fail the turn now.
+      const kind = Object.keys(ex).find((k) => !EXEC_ENVELOPE_FIELDS.has(k)) ?? "unknown";
+      end({
+        type: "done",
+        reason: "error",
+        code: "unimplemented",
+        error: `model requested native Cursor tool "${kind}", which this gateway cannot execute; check CURSOR_ALLOWED_NATIVE_TOOLS`,
+      });
+      return;
+    }
+
+    if (msg.interactionQuery) {
+      const kind = Object.keys(msg.interactionQuery).find((k) => k !== "id") ?? "unknown";
+      end({
+        type: "done",
+        reason: "error",
+        code: "unimplemented",
+        error: `upstream sent interaction query "${kind}", which this gateway cannot answer`,
+      });
       return;
     }
 
@@ -299,10 +403,12 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
       if (u.textDelta?.text) push({ type: "text", delta: String(u.textDelta.text) });
       else if (u.thinkingDelta?.text) push({ type: "thinking", delta: String(u.thinkingDelta.text) });
       else if (u.tokenDelta) {
-        // TokenDeltaUpdate carries a single `tokens` counter for the turn — there is
-        // no prompt/completion split on the wire, so report it as output only and
-        // leave prompt_tokens at 0 rather than inventing a number.
-        push({ type: "usage", outputTokens: finiteOrUndefined(u.tokenDelta.tokens) });
+        // Each update carries the tokens generated since the previous one.
+        const n = finiteOrUndefined(u.tokenDelta.tokens);
+        if (n !== undefined) {
+          reportedOutputTokens += n;
+          push({ type: "usage", outputTokens: reportedOutputTokens });
+        }
       } else if (u.turnEnded) end({ type: "done", reason: "stop" });
     }
   }
@@ -319,6 +425,19 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
 
   send({ runRequest });
 
+  // Cursor reports no prompt token count, so estimate what the caller sent. Cursor's
+  // own agent prompt is not visible to us and is not included.
+  yield {
+    type: "usage",
+    inputTokens: estimateTokens(
+      JSON.stringify(opts.rootMessages) +
+        opts.userText +
+        JSON.stringify(opts.tools) +
+        (opts.images ?? []).map((img) => `${img.mimeType}:${img.data.length}`).join(","),
+    ),
+  };
+  let outputText = "";
+
   try {
     for (;;) {
       if (queue.length === 0) {
@@ -328,6 +447,11 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
       }
       const ev = queue.shift()!;
       if (ev.type === "text" && ev.delta === "") continue;
+      if (ev.type === "text" || ev.type === "thinking") outputText += ev.delta;
+      else if (ev.type === "tool_call") outputText += ev.name + JSON.stringify(ev.args);
+      else if (ev.type === "done" && reportedOutputTokens === 0 && outputText) {
+        yield { type: "usage", outputTokens: estimateTokens(outputText) };
+      }
       yield ev;
       if (ev.type === "done") return;
     }
@@ -345,6 +469,110 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
       /* already closed */
     }
   }
+}
+
+/**
+ * The server namespaces caller tools as `<providerIdentifier>-<name>` in `name`
+ * (e.g. `openai-bash`); the caller only knows the bare name it declared.
+ */
+/**
+ * Cursor natives that correspond to a caller's tool. Grok calls these after a
+ * tool result even when the same capability was already exposed as MCP. Bridging
+ * them keeps the agent loop on the caller instead of dying with "Tool not available".
+ */
+export function nativeToolCallFromExec(
+  ex: Record<string, any>,
+): { name: string; aliases: string[]; args: Record<string, unknown>; id: unknown } | undefined {
+  const idOf = (a: Record<string, any>): unknown => a.toolCallId ?? ex.execId ?? ex.id;
+  if (ex.piBashArgs || ex.shellArgs || ex.shellStreamArgs || ex.miniSweAgentBashArgs) {
+    const a = ex.piBashArgs ?? ex.shellArgs ?? ex.shellStreamArgs ?? ex.miniSweAgentBashArgs;
+    // Only Pi's bash timeout is in seconds. ShellArgs.timeout has no documented unit.
+    const timeout = ex.piBashArgs ? a.timeout : undefined;
+    return { name: "bash", aliases: ["shell"], args: defined({ command: a.command, timeout }), id: idOf(a) };
+  }
+  if (ex.piReadArgs || ex.readArgs || ex.redactedReadArgs) {
+    const a = ex.piReadArgs ?? ex.readArgs ?? ex.redactedReadArgs;
+    return { name: "read", aliases: [], args: defined({ path: a.path, offset: a.offset, limit: a.limit }), id: idOf(a) };
+  }
+  if (ex.piEditArgs) {
+    const a = ex.piEditArgs;
+    const edits = Array.isArray(a.edits)
+      ? a.edits.map((edit: Record<string, any>) => defined({ oldText: edit.oldText, newText: edit.newText }))
+      : [];
+    return { name: "edit", aliases: [], args: defined({ path: a.path, edits }), id: idOf(a) };
+  }
+  if (ex.piWriteArgs || ex.writeArgs) {
+    const a = ex.piWriteArgs ?? ex.writeArgs;
+    return {
+      name: "write",
+      aliases: [],
+      args: defined({ path: a.path, content: a.content ?? a.fileText }),
+      id: idOf(a),
+    };
+  }
+  if (ex.piGrepArgs || ex.grepArgs) {
+    const a = ex.piGrepArgs ?? ex.grepArgs;
+    return {
+      name: "grep",
+      aliases: [],
+      args: defined({
+        pattern: a.pattern,
+        path: a.path,
+        glob: a.glob,
+        ignoreCase: a.ignoreCase ?? a.caseInsensitive,
+        literal: a.literal,
+        context: a.context,
+        limit: a.limit ?? a.headLimit,
+      }),
+      id: idOf(a),
+    };
+  }
+  if (ex.piFindArgs) {
+    const a = ex.piFindArgs;
+    return { name: "find", aliases: [], args: defined({ pattern: a.pattern, path: a.path, limit: a.limit }), id: idOf(a) };
+  }
+  if (ex.piLsArgs || ex.lsArgs) {
+    const a = ex.piLsArgs ?? ex.lsArgs;
+    return { name: "ls", aliases: [], args: defined({ path: a.path, limit: a.limit }), id: idOf(a) };
+  }
+  return undefined;
+}
+
+function declaredName(name: string, aliases: string[], declared: Set<string>): string {
+  if (declared.size === 0 || declared.has(name)) return name;
+  for (const alias of aliases) if (declared.has(alias)) return alias;
+  return name;
+}
+
+function defined(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined || value === null || value === "") continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function callerToolName(a: Record<string, any>, declared: Set<string>): string {
+  const candidates = [a.toolName, a.name].filter((v): v is string => typeof v === "string" && v !== "");
+  for (const c of candidates) if (declared.has(c)) return c;
+  for (const c of candidates) {
+    for (const prefix of [`${a.providerIdentifier ?? MCP_PROVIDER}-`, `${MCP_PROVIDER}-`]) {
+      if (c.startsWith(prefix) && declared.has(c.slice(prefix.length))) return c.slice(prefix.length);
+    }
+  }
+  return candidates[0] ?? "unknown";
+}
+
+/** Rough token count: ~4 ASCII characters per token, one token per other character. */
+export function estimateTokens(text: string): number {
+  let ascii = 0;
+  let other = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) < 0x80) ascii++;
+    else other++;
+  }
+  return Math.ceil(ascii / 4) + other;
 }
 
 function finiteOrUndefined(v: unknown): number | undefined {

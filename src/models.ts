@@ -58,6 +58,53 @@ export function upstreamId(name: string, prefix: string, known: readonly string[
   return trimmed;
 }
 
+const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)(-fast)?$/;
+
+/** Requested reasoning effort → upstream variant suffixes to try, in order. */
+const EFFORT_VARIANTS: Record<string, string[]> = {
+  none: ["low"],
+  minimal: ["low"],
+  low: ["low"],
+  medium: ["medium"],
+  high: ["high"],
+  xhigh: ["xhigh", "high"],
+  "x-high": ["xhigh", "high"],
+  max: ["max", "xhigh", "high"],
+};
+
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+/**
+ * Cursor encodes reasoning effort in the model id (`grok-4.7-low` … `-xhigh`) and
+ * ignores any effort parameter. For models matching `patterns`, swap the id's
+ * effort suffix for the one the caller asked for, keeping a `-fast` tail, when that
+ * variant exists upstream. Gateways in front of us may fill in a default effort for
+ * callers that sent none, which is why this is limited to an opt-in model set.
+ */
+export function applyRequestedEffort(
+  model: string,
+  effort: string | undefined,
+  known: readonly string[],
+  patterns: readonly string[],
+  prefix: string,
+): string {
+  const variants = effort ? EFFORT_VARIANTS[effort.trim().toLowerCase()] : undefined;
+  if (!variants) return model;
+  const bare = prefix && model.startsWith(prefix) ? model.slice(prefix.length) : model;
+  if (!patterns.some((p) => globToRegExp(p).test(model) || globToRegExp(p).test(bare))) return model;
+  const match = EFFORT_SUFFIX.exec(model);
+  if (!match) return model;
+  const stem = model.slice(0, match.index);
+  for (const v of variants) {
+    const candidate = `${stem}-${v}${match[2] ?? ""}`;
+    if (known.includes(candidate)) return candidate;
+  }
+  return model;
+}
+
 export async function listModelIds(token: string, config: Config): Promise<string[]> {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.ids;
   try {

@@ -37,15 +37,24 @@ function list(name: string, fallback: string[]): string[] {
  * prompt plus a 41-entry native tool registry no matter what we send; the
  * `x-cursor-agent-allowed-tools` header is the only lever that removes them.
  *
- * Default: allow ONLY `mcp_tool_call`, i.e. the model sees exactly the tools the
- * OpenAI caller declared and nothing else. Verified against api2.cursor.sh:
- * asking the model to list its tools returns only the caller's tool names.
+ * Default: only the caller's MCP tools, plus `get_mcp_tools_tool_call`. The
+ * server rejects every run with "Required tool GET_MCP_TOOLS not found in
+ * allTools" when that one is filtered out. Its exec (`mcp_state_exec_args`) is
+ * answered with the caller's tool list.
+ *
+ * shell/read/grep/ls and the pi_* tools stay out of the default. Cursor shows
+ * them to the model as Shell, Read, and Grep. Grok then treats that list as the
+ * real function interface and the caller's bash/read/edit/write/grep/find/ls
+ * names as a conflicting configuration ("工具名对不上"). With only the MCP tools
+ * allowed, the same model lists and calls those caller names, including on the
+ * turn after a tool result. session.ts still bridges Shell, Read, and pi_* back
+ * onto the caller's names when an operator opts into them.
  *
  * Set CURSOR_ALLOWED_NATIVE_TOOLS to a comma-separated list of ToolCall oneof
  * proto names (e.g. `mcp_tool_call,web_search_tool_call`) to let some natives
  * back in, or to `*` to disable the header entirely.
  */
-export const DEFAULT_ALLOWED_TOOLS = ["mcp_tool_call"];
+export const DEFAULT_ALLOWED_TOOLS = ["mcp_tool_call", "get_mcp_tools_tool_call"];
 
 export interface Config {
   host: string;
@@ -68,6 +77,11 @@ export interface Config {
   allowedNativeTools: string[];
   /** Client-visible model prefix. CPA exposes these names verbatim. */
   modelPrefix: string;
+  /**
+   * Model globs whose effort suffix follows the request's `reasoning_effort` /
+   * `reasoning.effort`. Empty = never. See applyRequestedEffort().
+   */
+  effortFromRequestModels: string[];
   /** Path to the JSON token store (array of accounts). */
   authFile: string;
   requestTimeoutMs: number;
@@ -79,8 +93,9 @@ export interface Config {
    * Cursor's `resumeAction` resumes a conversation the server is already holding;
    * an OpenAI caller is stateless and replays its whole history each time, so there
    * is nothing server-side to resume and the turn comes back empty. The history
-   * already carries the assistant tool-call and its result, so a short neutral
-   * continuation turn is enough to get the follow-up answer.
+   * already carries the assistant tool-call and its result. The prompt must tell
+   * the model to call the next tool. "Continue" makes Grok stop and ask the user
+   * to confirm.
    */
   continuationPrompt: string;
   logRequests: boolean;
@@ -99,12 +114,16 @@ export function loadConfig(): Config {
         ? []
         : list("CURSOR_ALLOWED_NATIVE_TOOLS", DEFAULT_ALLOWED_TOOLS),
     modelPrefix: str("CURSOR_DIRECT_MODEL_PREFIX", "cursor-"),
+    effortFromRequestModels:
+      str("CURSOR_EFFORT_FROM_REQUEST_MODELS", "").trim() === "none"
+        ? []
+        : list("CURSOR_EFFORT_FROM_REQUEST_MODELS", ["grok-*"]),
     authFile: str("CURSOR_DIRECT_AUTH_FILE", "./accounts.json"),
     requestTimeoutMs: num("CURSOR_DIRECT_TIMEOUT_MS", 300_000),
     systemAsHistory: bool("CURSOR_DIRECT_SYSTEM_AS_HISTORY", true),
     continuationPrompt: str(
       "CURSOR_DIRECT_CONTINUATION_PROMPT",
-      "Continue, using the tool results above.",
+      "The tool result is already in the history. If the task is unfinished, call the next tool now. Do not ask the user to continue.",
     ),
     logRequests: bool("CURSOR_DIRECT_LOG_REQUESTS", true),
   };
