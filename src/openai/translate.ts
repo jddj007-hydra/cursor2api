@@ -170,7 +170,7 @@ function imageSize(data: Buffer, mimeType: string): { width?: number; height?: n
 }
 
 const HANDBACK_PROSE =
-  /回一句|工具通道|被掐断|bash\s*通道|工具调用又|工具调用失败|没有发出去|没跑成|没有执行成功|没能跑起来|工具当前不可用|Shell\s*工具[^。\n]{0,24}不可用|tool is unavailable|tools are unavailable|tool not available|shell tool is failing|shell tool is unavailable/i;
+  /回一句|工具通道|被掐断|bash\s*通道|工具调用又|工具调用失败|没有发出去|没跑成|没有执行成功|没能跑起来|工具当前不可用|Shell\s*工具[^。\n]{0,24}不可用|tool is unavailable|tools are unavailable|tool not available|shell tool is failing|shell tool is unavailable|GetDynamicTools|CallDynamicTool|aren't available as direct tools|isn't available in this session|aren't direct tools|isn'?t available directly|aren'?t available directly|dynamic tool gateway|no shell or command tool is exposed|not going to continue on that instruction alone/i;
 
 /** Model gave up and handed the turn back to the user instead of calling the next tool. */
 export function isToolHandback(text: string): boolean {

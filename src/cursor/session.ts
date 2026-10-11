@@ -351,11 +351,12 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
       }
       const native = nativeToolCallFromExec(ex);
       if (native) {
+        const name = resolveCallerToolName(declaredName(native.name, native.aliases, declaredTools), declaredTools);
         push({
           type: "tool_call",
           id: safeToolCallId(native.id),
-          name: declaredName(native.name, native.aliases, declaredTools),
-          args: native.args,
+          name,
+          args: alignCallerToolArgs(name, native.args, opts.tools),
         });
         // Same as mcp_args: the caller runs the tool and replays the result.
         end({ type: "done", reason: "tool_calls" });
@@ -365,11 +366,12 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
         const a = ex.mcpArgs;
         const args: Record<string, unknown> = {};
         for (const [key, raw] of Object.entries(a.args ?? {})) args[key] = decodeArgValue(raw);
+        const name = callerToolName(a, declaredTools);
         push({
           type: "tool_call",
           id: safeToolCallId(a.toolCallId),
-          name: callerToolName(a, declaredTools),
-          args,
+          name,
+          args: alignCallerToolArgs(name, args, opts.tools),
         });
         // Hand control back to the caller — it owns tool execution.
         end({ type: "done", reason: "tool_calls" });
@@ -488,11 +490,11 @@ export function nativeToolCallFromExec(
     const a = ex.piBashArgs ?? ex.shellArgs ?? ex.shellStreamArgs ?? ex.miniSweAgentBashArgs;
     // Only Pi's bash timeout is in seconds. ShellArgs.timeout has no documented unit.
     const timeout = ex.piBashArgs ? a.timeout : undefined;
-    return { name: "bash", aliases: ["shell"], args: defined({ command: a.command, timeout }), id: idOf(a) };
+    return { name: "bash", aliases: ["shell", "Bash"], args: defined({ command: a.command, timeout }), id: idOf(a) };
   }
   if (ex.piReadArgs || ex.readArgs || ex.redactedReadArgs) {
     const a = ex.piReadArgs ?? ex.readArgs ?? ex.redactedReadArgs;
-    return { name: "read", aliases: [], args: defined({ path: a.path, offset: a.offset, limit: a.limit }), id: idOf(a) };
+    return { name: "read", aliases: ["Read"], args: defined({ path: a.path, offset: a.offset, limit: a.limit }), id: idOf(a) };
   }
   if (ex.piEditArgs) {
     const a = ex.piEditArgs;
@@ -505,7 +507,7 @@ export function nativeToolCallFromExec(
     const a = ex.piWriteArgs ?? ex.writeArgs;
     return {
       name: "write",
-      aliases: [],
+      aliases: ["Write"],
       args: defined({ path: a.path, content: a.content ?? a.fileText }),
       id: idOf(a),
     };
@@ -514,7 +516,7 @@ export function nativeToolCallFromExec(
     const a = ex.piGrepArgs ?? ex.grepArgs;
     return {
       name: "grep",
-      aliases: [],
+      aliases: ["Grep"],
       args: defined({
         pattern: a.pattern,
         path: a.path,
@@ -538,6 +540,61 @@ export function nativeToolCallFromExec(
   return undefined;
 }
 
+// Cursor and Kimi-backed Claude models often emit Pi/Cursor arg names (`path`,
+// `filePath`, `oldString`) for Claude Code tools whose schema says `file_path`.
+// Same idea as the Grok bridge: keep the caller's declared names and fields.
+// A schema that already uses `path` (Pi read) is left alone.
+const CALLER_ARG_ALIASES: Record<string, string[]> = {
+  path: ["file_path", "filePath"],
+  file: ["file_path", "filePath", "path"],
+  filepath: ["file_path", "filePath", "path"],
+  filePath: ["file_path", "path"],
+  file_path: ["filePath", "path"],
+  oldString: ["old_string"],
+  old_string: ["oldString"],
+  newString: ["new_string"],
+  new_string: ["newString"],
+  replaceAll: ["replace_all"],
+  replace_all: ["replaceAll"],
+  cmd: ["command"],
+};
+
+export function alignCallerToolArgs(
+  name: string,
+  args: Record<string, unknown>,
+  tools: McpToolDefinition[],
+): Record<string, unknown> {
+  const tool = tools.find((item) => item.name === name || item.toolName === name);
+  if (!tool) return args;
+  let schema: { properties?: Record<string, unknown> } = {};
+  try {
+    schema = JSON.parse(tool.inputSchemaJson) as { properties?: Record<string, unknown> };
+  } catch {
+    return args;
+  }
+  const props = schema.properties;
+  if (!props || typeof props !== "object") return args;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (Object.prototype.hasOwnProperty.call(props, key)) {
+      out[key] = value;
+      continue;
+    }
+    const target = (CALLER_ARG_ALIASES[key] ?? []).find((candidate) =>
+      Object.prototype.hasOwnProperty.call(props, candidate),
+    );
+    if (!target) {
+      out[key] = value;
+      continue;
+    }
+    // Schema already has the real field, including when the model sent both.
+    if (!Object.prototype.hasOwnProperty.call(args, target) && !Object.prototype.hasOwnProperty.call(out, target)) {
+      out[target] = value;
+    }
+  }
+  return out;
+}
+
 function declaredName(name: string, aliases: string[], declared: Set<string>): string {
   if (declared.size === 0 || declared.has(name)) return name;
   for (const alias of aliases) if (declared.has(alias)) return alias;
@@ -553,15 +610,47 @@ function defined(args: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+// Cursor's own prompt still says Shell / Read / Grep. Claude Code declares
+// Bash / Read / Write / Edit / Grep for every Claude model. Pi declares the
+// lowercase names. Map only when exactly one declared tool is in the group.
+const TOOL_NAME_GROUPS: string[][] = [
+  ["bash", "shell"],
+  ["read"],
+  ["write"],
+  ["edit", "strreplace", "str_replace"],
+  ["grep"],
+  ["glob"],
+  ["webfetch", "web_fetch"],
+  ["websearch", "web_search"],
+  ["todowrite", "todo_write"],
+  ["ls", "list_dir"],
+];
+
+export function resolveCallerToolName(raw: string, declared: Set<string>): string {
+  if (!raw || declared.size === 0 || declared.has(raw)) return raw;
+  const lower = raw.toLowerCase();
+  const sameCase = [...declared].filter((name) => name.toLowerCase() === lower);
+  if (sameCase.length === 1) return sameCase[0]!;
+  const group = TOOL_NAME_GROUPS.find((item) => item.includes(lower));
+  if (!group) return raw;
+  const hits = [...declared].filter((name) => group.includes(name.toLowerCase()));
+  return hits.length === 1 ? hits[0]! : raw;
+}
+
 function callerToolName(a: Record<string, any>, declared: Set<string>): string {
   const candidates = [a.toolName, a.name].filter((v): v is string => typeof v === "string" && v !== "");
-  for (const c of candidates) if (declared.has(c)) return c;
-  for (const c of candidates) {
-    for (const prefix of [`${a.providerIdentifier ?? MCP_PROVIDER}-`, `${MCP_PROVIDER}-`]) {
-      if (c.startsWith(prefix) && declared.has(c.slice(prefix.length))) return c.slice(prefix.length);
+  const prefixes = [`${a.providerIdentifier ?? MCP_PROVIDER}-`, `${MCP_PROVIDER}-`];
+  const bare = (value: string): string => {
+    for (const prefix of prefixes) {
+      if (value.startsWith(prefix)) return value.slice(prefix.length);
     }
+    return value;
+  };
+  for (const c of candidates) {
+    const resolved = resolveCallerToolName(bare(c), declared);
+    if (declared.size === 0 || declared.has(resolved)) return resolved;
   }
-  return candidates[0] ?? "unknown";
+  return resolveCallerToolName(bare(candidates[0] ?? "unknown"), declared);
 }
 
 /** Rough token count: ~4 ASCII characters per token, one token per other character. */

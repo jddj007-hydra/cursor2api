@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_ALLOWED_TOOLS } from "../src/config.js";
-import { nativeToolCallFromExec } from "../src/cursor/session.js";
+import {
+  alignCallerToolArgs,
+  nativeToolCallFromExec,
+  resolveCallerToolName,
+  type McpToolDefinition,
+} from "../src/cursor/session.js";
 import { isToolHandback, stripHandbackProse } from "../src/openai/translate.js";
 
 test("default allow-list keeps the caller's tool names", () => {
@@ -10,7 +15,7 @@ test("default allow-list keeps the caller's tool names", () => {
 
 test("pi bash and native shell both become a bash tool call", () => {
   const pi = nativeToolCallFromExec({ piBashArgs: { command: "echo STEP2", timeout: 5, toolCallId: "abc" } });
-  assert.deepEqual(pi, { name: "bash", aliases: ["shell"], args: { command: "echo STEP2", timeout: 5 }, id: "abc" });
+  assert.deepEqual(pi, { name: "bash", aliases: ["shell", "Bash"], args: { command: "echo STEP2", timeout: 5 }, id: "abc" });
 
   const shell = nativeToolCallFromExec({ execId: "exec-1", shellArgs: { command: "pwd", timeout: 1000 } });
   assert.equal(shell?.name, "bash");
@@ -43,6 +48,88 @@ test("bash-cut prose is removed and the real finding stays", () => {
   );
   assert.equal(
     stripHandbackProse("STEP2 没跑成，再执行一次。Shell 工具当前不可用，所以 echo 没能跑起来。"),
+    "",
+  );
+});
+
+test("claude code Read path is rewritten to file_path; Pi path stays", () => {
+  const claudeRead: McpToolDefinition = {
+    name: "Read",
+    toolName: "Read",
+    providerIdentifier: "openai",
+    description: "",
+    inputSchemaJson: JSON.stringify({
+      type: "object",
+      properties: { file_path: { type: "string" }, offset: { type: "integer" } },
+      required: ["file_path"],
+    }),
+  };
+  const piRead: McpToolDefinition = {
+    name: "read",
+    toolName: "read",
+    providerIdentifier: "openai",
+    description: "",
+    inputSchemaJson: JSON.stringify({ type: "object", properties: { path: { type: "string" } } }),
+  };
+  assert.deepEqual(alignCallerToolArgs("Read", { path: "/tmp/a.py", offset: 1 }, [claudeRead]), {
+    file_path: "/tmp/a.py",
+    offset: 1,
+  });
+  assert.deepEqual(alignCallerToolArgs("Read", { file_path: "/keep", path: "/drop" }, [claudeRead]), {
+    file_path: "/keep",
+  });
+  assert.deepEqual(alignCallerToolArgs("read", { path: "src/a.ts" }, [piRead]), { path: "src/a.ts" });
+  assert.deepEqual(
+    alignCallerToolArgs("Edit", { filePath: "a.py", oldString: "a", newString: "b", replaceAll: false }, [
+      {
+        name: "Edit",
+        toolName: "Edit",
+        providerIdentifier: "openai",
+        description: "",
+        inputSchemaJson: JSON.stringify({
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+            old_string: { type: "string" },
+            new_string: { type: "string" },
+            replace_all: { type: "boolean" },
+          },
+        }),
+      },
+    ]),
+    { file_path: "a.py", old_string: "a", new_string: "b", replace_all: false },
+  );
+});
+
+test("cursor Shell/Read names map onto whichever tool the caller declared", () => {
+  const claude = new Set(["Bash", "Read", "Write", "Edit", "Grep"]);
+  assert.equal(resolveCallerToolName("Shell", claude), "Bash");
+  assert.equal(resolveCallerToolName("shell", claude), "Bash");
+  assert.equal(resolveCallerToolName("Read", claude), "Read");
+  assert.equal(resolveCallerToolName("str_replace", claude), "Edit");
+  assert.equal(resolveCallerToolName("WebFetch", claude), "WebFetch");
+
+  const pi = new Set(["bash", "read", "edit", "write"]);
+  assert.equal(resolveCallerToolName("Shell", pi), "bash");
+  assert.equal(resolveCallerToolName("Read", pi), "read");
+  assert.equal(resolveCallerToolName("Bash", pi), "bash");
+
+  const both = new Set(["shell", "Bash"]);
+  assert.equal(resolveCallerToolName("Shell", both), "shell");
+  assert.equal(resolveCallerToolName("NotATool", claude), "NotATool");
+});
+
+test("dynamic-tool handback is stripped", () => {
+  assert.equal(isToolHandback("The `Read` tool isn't available in this session."), true);
+  assert.equal(isToolHandback("`Write` and `Bash` aren't available as direct tools."), true);
+  assert.equal(
+    stripHandbackProse("Fix is in calc.py. I can only reach tools through GetDynamicTools and CallDynamicTool."),
+    "Fix is in calc.py.",
+  );
+  assert.equal(
+    stripHandbackProse(
+      "I'm not going to continue on that instruction alone. The shell tool isn't available directly, so I'll use the dynamic tool gateway. No shell or command tool is exposed in this session.",
+    ),
     "",
   );
 });

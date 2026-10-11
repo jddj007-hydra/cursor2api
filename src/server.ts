@@ -132,7 +132,17 @@ async function chatCompletions(
     let chosen = first;
     if (handback) {
       log("continuation handed back without a tool call; retrying");
-      const second = await collect(run("Call the next tool immediately. Do not reply to the user."));
+      // Claude refuses "do not reply" and stops. Name the caller's tools instead.
+      // The same list is Bash/Read/Write/Edit for every Claude model, and the
+      // caller's own names for Pi or Grok.
+      const toolNames = input.tools.map((tool) => tool.name).filter(Boolean).join(", ");
+      const second = await collect(
+        run(
+          toolNames
+            ? `The tool result is already in the history. Continue the original task by calling one of these tools: ${toolNames}.`
+            : "The tool result is already in the history. Continue the original task by calling the next tool.",
+        ),
+      );
       const secondActs = second.toolCalls.length > 0 || second.reason === "error";
       chosen = secondActs ? second : richer(first, second);
     }
