@@ -165,7 +165,7 @@ resp.choices[0].message.tool_calls[0].function.arguments   # '{"city":"Osaka"}'
 | `CURSOR_DIRECT_API_KEY` | — | 要求 `Authorization: Bearer <key>`。**端口不只是 localhost 可达时务必设置。** |
 | `CURSOR_DIRECT_AUTH_FILE` | `./accounts.json` | 账号 / token 存储 |
 | `CURSOR_DIRECT_MODEL_PREFIX` | `cursor-` | 暴露的模型名前缀 |
-| `CURSOR_ALLOWED_NATIVE_TOOLS` | `mcp_tool_call,get_mcp_tools_tool_call,shell_tool_call` | 模型能看到的原生工具。保留 `shell_tool_call`，否则工具结果之后 Claude 不再调用 Bash。不要加 read/grep/edit/pi_*，否则参数名会变成 path，而不是调用方的 file_path。`*` = 全部 41 个 |
+| `CURSOR_ALLOWED_NATIVE_TOOLS` | `mcp_tool_call,get_mcp_tools_tool_call,shell_tool_call,read_tool_call,grep_tool_call,ls_tool_call,pi_bash_tool_call,pi_read_tool_call,pi_edit_tool_call,pi_write_tool_call,pi_grep_tool_call,pi_find_tool_call,pi_ls_tool_call` | 模型能看到的原生工具。网关会改写成调用方自己的工具名和参数名，Claude Code 和 Pi 可以共用。不加 `edit_tool_call`，因为那条 exec 没有旧文本和新文本。`*` = 全部 41 个 |
 | `CURSOR_DIRECT_PROXY_URL` | — | 全部上游流量走 SOCKS5，如 `socks5://127.0.0.1:1080` |
 | `CURSOR_DIRECT_CLIENT_VERSION` | `cli-2026.08.11-…` | Cursor 卡旧客户端版本时改这里 |
 | `CURSOR_DIRECT_SYSTEM_AS_HISTORY` | `true` | `system` 消息的投递方式（见下） |

@@ -9,11 +9,21 @@ import {
 } from "../src/cursor/session.js";
 import { isToolHandback, stripHandbackProse } from "../src/openai/translate.js";
 
-test("default allow-list keeps Shell and the caller's MCP tools", () => {
+test("default allow-list exposes shell, read, grep, and the Pi tools", () => {
   assert.deepEqual(DEFAULT_ALLOWED_TOOLS, [
     "mcp_tool_call",
     "get_mcp_tools_tool_call",
     "shell_tool_call",
+    "read_tool_call",
+    "grep_tool_call",
+    "ls_tool_call",
+    "pi_bash_tool_call",
+    "pi_read_tool_call",
+    "pi_edit_tool_call",
+    "pi_write_tool_call",
+    "pi_grep_tool_call",
+    "pi_find_tool_call",
+    "pi_ls_tool_call",
   ]);
 });
 
@@ -103,6 +113,52 @@ test("claude code Read path is rewritten to file_path; Pi path stays", () => {
     ]),
     { file_path: "a.py", old_string: "a", new_string: "b", replace_all: false },
   );
+});
+
+test("Pi edits become Claude old_string/new_string and stay an array for Pi", () => {
+  const claudeEdit: McpToolDefinition = {
+    name: "Edit",
+    toolName: "Edit",
+    providerIdentifier: "openai",
+    description: "",
+    inputSchemaJson: JSON.stringify({
+      type: "object",
+      properties: {
+        file_path: { type: "string" },
+        old_string: { type: "string" },
+        new_string: { type: "string" },
+      },
+      required: ["file_path", "old_string", "new_string"],
+    }),
+  };
+  const piEdit: McpToolDefinition = {
+    name: "edit",
+    toolName: "edit",
+    providerIdentifier: "openai",
+    description: "",
+    inputSchemaJson: JSON.stringify({
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        edits: { type: "array" },
+      },
+    }),
+  };
+  const edits = [{ oldText: "foo", newText: "bar" }];
+  assert.deepEqual(alignCallerToolArgs("Edit", { path: "a.py", edits }, [claudeEdit]), {
+    file_path: "a.py",
+    old_string: "foo",
+    new_string: "bar",
+  });
+  assert.deepEqual(alignCallerToolArgs("edit", { path: "a.py", edits }, [piEdit]), {
+    path: "a.py",
+    edits,
+  });
+});
+
+test("find maps to Glob only when that is the declared tool", () => {
+  assert.equal(resolveCallerToolName("find", new Set(["Glob"])), "Glob");
+  assert.equal(resolveCallerToolName("find", new Set(["find", "ls"])), "find");
 });
 
 test("cursor Shell/Read names map onto whichever tool the caller declared", () => {

@@ -501,7 +501,7 @@ export function nativeToolCallFromExec(
     const edits = Array.isArray(a.edits)
       ? a.edits.map((edit: Record<string, any>) => defined({ oldText: edit.oldText, newText: edit.newText }))
       : [];
-    return { name: "edit", aliases: [], args: defined({ path: a.path, edits }), id: idOf(a) };
+    return { name: "edit", aliases: ["Edit"], args: defined({ path: a.path, edits }), id: idOf(a) };
   }
   if (ex.piWriteArgs || ex.writeArgs) {
     const a = ex.piWriteArgs ?? ex.writeArgs;
@@ -531,7 +531,12 @@ export function nativeToolCallFromExec(
   }
   if (ex.piFindArgs) {
     const a = ex.piFindArgs;
-    return { name: "find", aliases: [], args: defined({ pattern: a.pattern, path: a.path, limit: a.limit }), id: idOf(a) };
+    return {
+      name: "find",
+      aliases: ["Glob", "glob"],
+      args: defined({ pattern: a.pattern, path: a.path, limit: a.limit }),
+      id: idOf(a),
+    };
   }
   if (ex.piLsArgs || ex.lsArgs) {
     const a = ex.piLsArgs ?? ex.lsArgs;
@@ -552,12 +557,25 @@ const CALLER_ARG_ALIASES: Record<string, string[]> = {
   file_path: ["filePath", "path"],
   oldString: ["old_string"],
   old_string: ["oldString"],
+  oldText: ["old_string", "oldString"],
+  old_text: ["old_string", "oldString"],
   newString: ["new_string"],
   new_string: ["newString"],
+  newText: ["new_string", "newString"],
+  new_text: ["new_string", "newString"],
   replaceAll: ["replace_all"],
   replace_all: ["replaceAll"],
   cmd: ["command"],
+  ignoreCase: ["ignore_case"],
+  ignore_case: ["ignoreCase"],
+  headLimit: ["head_limit", "limit"],
+  head_limit: ["headLimit", "limit"],
 };
+
+function editText(edit: Record<string, unknown>, which: "old" | "new"): unknown {
+  if (which === "old") return edit.oldText ?? edit.old_text ?? edit.oldString ?? edit.old_string;
+  return edit.newText ?? edit.new_text ?? edit.newString ?? edit.new_string;
+}
 
 export function alignCallerToolArgs(
   name: string,
@@ -576,6 +594,30 @@ export function alignCallerToolArgs(
   if (!props || typeof props !== "object") return args;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args)) {
+    // Pi sends { edits: [{ oldText, newText }] }. Claude Code's Edit is one
+    // old_string/new_string pair and has no edits array.
+    if (key === "edits" && !Object.prototype.hasOwnProperty.call(props, "edits") && Array.isArray(value)) {
+      const first = value.find((item) => item && typeof item === "object") as Record<string, unknown> | undefined;
+      if (first) {
+        const oldText = editText(first, "old");
+        const newText = editText(first, "new");
+        if (
+          oldText !== undefined &&
+          Object.prototype.hasOwnProperty.call(props, "old_string") &&
+          !Object.prototype.hasOwnProperty.call(out, "old_string")
+        ) {
+          out.old_string = oldText;
+        }
+        if (
+          newText !== undefined &&
+          Object.prototype.hasOwnProperty.call(props, "new_string") &&
+          !Object.prototype.hasOwnProperty.call(out, "new_string")
+        ) {
+          out.new_string = newText;
+        }
+      }
+      continue;
+    }
     if (Object.prototype.hasOwnProperty.call(props, key)) {
       out[key] = value;
       continue;
@@ -619,7 +661,7 @@ const TOOL_NAME_GROUPS: string[][] = [
   ["write"],
   ["edit", "strreplace", "str_replace"],
   ["grep"],
-  ["glob"],
+  ["glob", "find"],
   ["webfetch", "web_fetch"],
   ["websearch", "web_search"],
   ["todowrite", "todo_write"],

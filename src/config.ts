@@ -37,20 +37,21 @@ function list(name: string, fallback: string[]): string[] {
  * prompt plus a 41-entry native tool registry no matter what we send; the
  * `x-cursor-agent-allowed-tools` header is the only lever that removes them.
  *
- * Default: only the caller's MCP tools, plus `get_mcp_tools_tool_call`. The
- * server rejects every run with "Required tool GET_MCP_TOOLS not found in
- * allTools" when that one is filtered out. Its exec (`mcp_state_exec_args`) is
- * answered with the caller's tool list.
+ * `get_mcp_tools_tool_call` stays in the default. The server rejects every run
+ * with "Required tool GET_MCP_TOOLS not found in allTools" when that one is
+ * filtered out. Its exec (`mcp_state_exec_args`) is answered with the caller's
+ * tool list.
  *
- * `shell_tool_call` is part of the default. Without it Cursor hides Shell, and
- * Claude stops calling the caller's Bash after the first tool result. The bridge
- * in session.ts maps that native Shell call back onto the declared Bash tool
- * (`command` stays the caller's argument name).
+ * Shell, Read, Grep, Ls, and the Pi bash/read/edit/write/grep/find/ls tools are
+ * in the default. Cursor hides a native that is not listed, and Claude then
+ * stops calling the matching caller tool. session.ts maps each of these back
+ * onto the name and argument keys the caller declared: Claude Code's Read/Edit
+ * (`file_path`, `old_string`) or Pi's read/edit (`path`, `edits`).
  *
- * read/grep/edit/ls and the pi_* tools stay out. Cursor shows them as Read,
- * Grep, and Edit, then calls those instead of the caller's tools, with argument
- * names the caller did not declare (`path` instead of `file_path`). session.ts
- * still bridges them when an operator opts in.
+ * Cursor's own `edit_tool_call` stays out. Its exec only carries a path and a
+ * content stream, not the old/new text a caller tool needs. Pi's
+ * `pi_edit_tool_call` is the edit that can be translated. `*` still means every
+ * native, including ones this gateway cannot run.
  *
  * Set CURSOR_ALLOWED_NATIVE_TOOLS to a comma-separated list of ToolCall oneof
  * proto names (e.g. `mcp_tool_call,web_search_tool_call`) to let some natives
@@ -60,6 +61,16 @@ export const DEFAULT_ALLOWED_TOOLS = [
   "mcp_tool_call",
   "get_mcp_tools_tool_call",
   "shell_tool_call",
+  "read_tool_call",
+  "grep_tool_call",
+  "ls_tool_call",
+  "pi_bash_tool_call",
+  "pi_read_tool_call",
+  "pi_edit_tool_call",
+  "pi_write_tool_call",
+  "pi_grep_tool_call",
+  "pi_find_tool_call",
+  "pi_ls_tool_call",
 ];
 
 export interface Config {
