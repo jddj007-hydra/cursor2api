@@ -176,7 +176,7 @@ All env vars, all optional.
 | `CURSOR_DIRECT_API_KEY` | — | Require `Authorization: Bearer <key>`. **Set this if the port is reachable from anywhere but localhost.** |
 | `CURSOR_DIRECT_AUTH_FILE` | `./accounts.json` | Account/token store |
 | `CURSOR_DIRECT_MODEL_PREFIX` | `cursor-` | Prefix on exposed model names |
-| `CURSOR_ALLOWED_NATIVE_TOOLS` | `mcp_tool_call,get_mcp_tools_tool_call` | Native tools the model may see. Leave shell/read/pi_* out so caller names (bash, read, edit) stay the function names. `*` keeps all 41. |
+| `CURSOR_ALLOWED_NATIVE_TOOLS` | `mcp_tool_call,get_mcp_tools_tool_call,shell_tool_call` | Native tools the model may see. `shell_tool_call` keeps Bash available after a tool result. Leave read/grep/edit/pi_* out so those calls keep the caller's argument names. `*` keeps all 41. |
 | `CURSOR_DIRECT_PROXY_URL` | — | SOCKS5 for all upstream traffic, e.g. `socks5://127.0.0.1:1080` |
 | `CURSOR_DIRECT_CLIENT_VERSION` | `cli-2026.08.11-…` | Bump if Cursor version-gates old clients |
 | `CURSOR_DIRECT_SYSTEM_AS_HISTORY` | `true` | How `system` messages are delivered (see below) |

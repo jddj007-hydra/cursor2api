@@ -42,19 +42,25 @@ function list(name: string, fallback: string[]): string[] {
  * allTools" when that one is filtered out. Its exec (`mcp_state_exec_args`) is
  * answered with the caller's tool list.
  *
- * shell/read/grep/ls and the pi_* tools stay out of the default. Cursor shows
- * them to the model as Shell, Read, and Grep. Grok then treats that list as the
- * real function interface and the caller's bash/read/edit/write/grep/find/ls
- * names as a conflicting configuration ("工具名对不上"). With only the MCP tools
- * allowed, the same model lists and calls those caller names, including on the
- * turn after a tool result. session.ts still bridges Shell, Read, and pi_* back
- * onto the caller's names when an operator opts into them.
+ * `shell_tool_call` is part of the default. Without it Cursor hides Shell, and
+ * Claude stops calling the caller's Bash after the first tool result. The bridge
+ * in session.ts maps that native Shell call back onto the declared Bash tool
+ * (`command` stays the caller's argument name).
+ *
+ * read/grep/edit/ls and the pi_* tools stay out. Cursor shows them as Read,
+ * Grep, and Edit, then calls those instead of the caller's tools, with argument
+ * names the caller did not declare (`path` instead of `file_path`). session.ts
+ * still bridges them when an operator opts in.
  *
  * Set CURSOR_ALLOWED_NATIVE_TOOLS to a comma-separated list of ToolCall oneof
  * proto names (e.g. `mcp_tool_call,web_search_tool_call`) to let some natives
  * back in, or to `*` to disable the header entirely.
  */
-export const DEFAULT_ALLOWED_TOOLS = ["mcp_tool_call", "get_mcp_tools_tool_call"];
+export const DEFAULT_ALLOWED_TOOLS = [
+  "mcp_tool_call",
+  "get_mcp_tools_tool_call",
+  "shell_tool_call",
+];
 
 export interface Config {
   host: string;

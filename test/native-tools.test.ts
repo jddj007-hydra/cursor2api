@@ -9,8 +9,12 @@ import {
 } from "../src/cursor/session.js";
 import { isToolHandback, stripHandbackProse } from "../src/openai/translate.js";
 
-test("default allow-list keeps the caller's tool names", () => {
-  assert.deepEqual(DEFAULT_ALLOWED_TOOLS, ["mcp_tool_call", "get_mcp_tools_tool_call"]);
+test("default allow-list keeps Shell and the caller's MCP tools", () => {
+  assert.deepEqual(DEFAULT_ALLOWED_TOOLS, [
+    "mcp_tool_call",
+    "get_mcp_tools_tool_call",
+    "shell_tool_call",
+  ]);
 });
 
 test("pi bash and native shell both become a bash tool call", () => {

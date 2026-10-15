@@ -19,9 +19,10 @@ services:
       # Model names are served as `cursor-<upstream id>`; set to "" for raw ids.
       - CURSOR_DIRECT_MODEL_PREFIX=cursor-
 
-      # Caller's tool names only. Do not add shell/read/pi_* here: the model then
-      # sees Shell/Read instead of bash/read/edit. `*` keeps every native.
-      - CURSOR_ALLOWED_NATIVE_TOOLS=mcp_tool_call,get_mcp_tools_tool_call
+      # Shell stays visible so Bash still runs after a tool result. Do not add
+      # read/grep/edit/pi_*: those replace the caller's argument names. `*` keeps
+      # every native.
+      - CURSOR_ALLOWED_NATIVE_TOOLS=mcp_tool_call,get_mcp_tools_tool_call,shell_tool_call
 
       # Route upstream traffic through a SOCKS5 proxy if your host needs one.
       # - CURSOR_DIRECT_PROXY_URL=socks5://host.docker.internal:1080

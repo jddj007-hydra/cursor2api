@@ -18,7 +18,7 @@ CURSOR_DIRECT_API_KEY=<random>
 CURSOR_DIRECT_AUTH_FILE=/etc/cursor2api/accounts.json
 CURSOR_DIRECT_PROTO_DIR=/opt/cursor2api/proto
 CURSOR_DIRECT_MODEL_PREFIX=cursor-
-CURSOR_ALLOWED_NATIVE_TOOLS=mcp_tool_call,get_mcp_tools_tool_call
+CURSOR_ALLOWED_NATIVE_TOOLS=mcp_tool_call,get_mcp_tools_tool_call,shell_tool_call
 ```
 
 Deploy the bundle rather than the source tree if the box has `node` but no `npm`:
