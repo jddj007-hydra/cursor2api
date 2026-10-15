@@ -1,7 +1,7 @@
 /**
  * OpenAI-compatible HTTP surface.
  *
- * Routes: GET /health, GET /v1/models, POST /v1/chat/completions.
+ * Routes: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/responses.
  * Designed to sit on 127.0.0.1 behind CLIProxyAPI's `openai-compatibility`
  * upstream, so there is no CORS handling and no browser surface.
  */
@@ -11,6 +11,7 @@ import type { Config } from "./config.js";
 import type { AccountPool } from "./auth.js";
 import { applyRequestedEffort, listModelIds, toModelList, upstreamId } from "./models.js";
 import { runTurn, type TurnEvent } from "./cursor/session.js";
+import { completedResponse, responsesEvents, responsesToChat, type ResponsesRequest } from "./openai/responses.js";
 import { buildTurnInput, isToolHandback, stripHandbackProse, type OpenAIChatRequest } from "./openai/translate.js";
 
 export interface ServerDeps {
@@ -55,6 +56,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, deps:
     return;
   }
 
+  if (route === "POST /v1/responses") {
+    await responses(req, res, deps);
+    return;
+  }
+
   sendJson(res, 404, { error: { message: `no route for ${route}`, type: "invalid_request_error" } });
 }
 
@@ -72,7 +78,6 @@ async function chatCompletions(
   deps: ServerDeps,
   _url: URL,
 ): Promise<void> {
-  const { config, pool, log } = deps;
   let body: OpenAIChatRequest;
   try {
     body = JSON.parse(await readBody(req)) as OpenAIChatRequest;
@@ -81,6 +86,65 @@ async function chatCompletions(
     return;
   }
 
+  const abort = new AbortController();
+  req.on("close", () => abort.abort());
+  const started = await turnEvents(body, deps, abort.signal, "chat");
+  if (body.stream) await streamResponse(res, started.events, started.clientModel, deps, started.accountLabel);
+  else await bufferResponse(res, started.events, started.clientModel, deps, started.accountLabel);
+}
+
+async function responses(req: http.IncomingMessage, res: http.ServerResponse, deps: ServerDeps): Promise<void> {
+  let raw: ResponsesRequest;
+  try {
+    raw = JSON.parse(await readBody(req)) as ResponsesRequest;
+  } catch (err) {
+    sendJson(res, 400, { error: { message: `bad JSON body: ${(err as Error).message}` } });
+    return;
+  }
+  const prepared = responsesToChat(raw);
+  const abort = new AbortController();
+  req.on("close", () => abort.abort());
+  const started = await turnEvents(prepared.request, deps, abort.signal, "responses");
+  const turn = await collect(started.events);
+  if (turn.reason === "error" && turn.toolCalls.length === 0 && !turn.text) {
+    deps.log(`upstream error (${started.accountLabel}): ${turn.error}`);
+    const failed = { text: "", toolCalls: [], usage: turn.usage, error: turn.error ?? "upstream error" };
+    if (raw.stream) {
+      writeResponsesSse(res, responsesEvents(started.clientModel, failed, prepared.customTools));
+      return;
+    }
+    const { status, body } = upstreamError(turn.code, turn.error);
+    sendJson(res, status, body);
+    return;
+  }
+  const result = { text: turn.text, toolCalls: turn.toolCalls, usage: turn.usage };
+  if (raw.stream) {
+    writeResponsesSse(res, responsesEvents(started.clientModel, result, prepared.customTools));
+    return;
+  }
+  sendJson(res, 200, completedResponse(started.clientModel, result, prepared.customTools));
+}
+
+function writeResponsesSse(res: http.ServerResponse, events: ReturnType<typeof responsesEvents>): void {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+  for (const event of events) {
+    res.write(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`);
+  }
+  res.end();
+}
+
+async function turnEvents(
+  body: OpenAIChatRequest,
+  deps: ServerDeps,
+  signal: AbortSignal,
+  surface: "chat" | "responses",
+): Promise<{ events: AsyncGenerator<TurnEvent>; clientModel: string; accountLabel: string }> {
+  const { config, pool, log } = deps;
   const account = await pool.next();
   const known = await listModelIds(account.accessToken, config);
   const clientModel = body.model ?? `${config.modelPrefix}auto`;
@@ -96,16 +160,13 @@ async function chatCompletions(
 
   if (config.logRequests) {
     log(
-      `chat account=${account.label} model=${model} history=${input.rootMessages.length} ` +
+      `${surface} account=${account.label} model=${model} history=${input.rootMessages.length} ` +
         `tools=${input.tools.length} stream=${Boolean(body.stream)} ` +
         `effort=${effort ?? "-"} ` +
         `images=${input.images.length} ` +
         `action=${input.userText.trim() || input.images.length > 0 ? "user" : "resume"}`,
     );
   }
-
-  const abort = new AbortController();
-  req.on("close", () => abort.abort());
 
   const run = (userText: string) =>
     runTurn({
@@ -116,7 +177,7 @@ async function chatCompletions(
       images: input.images,
       tools: input.tools,
       config,
-      signal: abort.signal,
+      signal,
     });
 
   const endsOnTool = (body.messages ?? []).at(-1)?.role === "tool";
@@ -134,7 +195,7 @@ async function chatCompletions(
       log("continuation handed back without a tool call; retrying");
       // Claude refuses "do not reply" and stops. Name the caller's tools instead.
       // The same list is Bash/Read/Write/Edit for every Claude model, and the
-      // caller's own names for Pi or Grok.
+      // caller's own names for Pi, Codex, or Grok.
       const toolNames = input.tools.map((tool) => tool.name).filter(Boolean).join(", ");
       const second = await collect(
         run(
@@ -148,9 +209,7 @@ async function chatCompletions(
     }
     events = stripStream(replay(chosen));
   }
-
-  if (body.stream) await streamResponse(res, events, clientModel, deps, account.label);
-  else await bufferResponse(res, events, clientModel, deps, account.label);
+  return { events, clientModel, accountLabel: account.label };
 }
 
 function richer(a: Collected, b: Collected): Collected {

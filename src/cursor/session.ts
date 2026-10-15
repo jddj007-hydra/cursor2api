@@ -351,12 +351,12 @@ export async function* runTurn(opts: RunTurnOptions): AsyncGenerator<TurnEvent> 
       }
       const native = nativeToolCallFromExec(ex);
       if (native) {
-        const name = resolveCallerToolName(declaredName(native.name, native.aliases, declaredTools), declaredTools);
+        const presented = presentCallerTool(native, opts.tools);
         push({
           type: "tool_call",
           id: safeToolCallId(native.id),
-          name,
-          args: alignCallerToolArgs(name, native.args, opts.tools),
+          name: presented.name,
+          args: presented.args,
         });
         // Same as mcp_args: the caller runs the tool and replays the result.
         end({ type: "done", reason: "tool_calls" });
@@ -550,11 +550,11 @@ export function nativeToolCallFromExec(
 // Same idea as the Grok bridge: keep the caller's declared names and fields.
 // A schema that already uses `path` (Pi read) is left alone.
 const CALLER_ARG_ALIASES: Record<string, string[]> = {
-  path: ["file_path", "filePath"],
-  file: ["file_path", "filePath", "path"],
-  filepath: ["file_path", "filePath", "path"],
-  filePath: ["file_path", "path"],
-  file_path: ["filePath", "path"],
+  path: ["file_path", "filePath", "target_file", "target_directory"],
+  file: ["file_path", "filePath", "path", "target_file"],
+  filepath: ["file_path", "filePath", "path", "target_file"],
+  filePath: ["file_path", "path", "target_file"],
+  file_path: ["filePath", "path", "target_file"],
   oldString: ["old_string"],
   old_string: ["oldString"],
   oldText: ["old_string", "oldString"],
@@ -565,7 +565,9 @@ const CALLER_ARG_ALIASES: Record<string, string[]> = {
   new_text: ["new_string", "newString"],
   replaceAll: ["replace_all"],
   replace_all: ["replaceAll"],
+  command: ["cmd"],
   cmd: ["command"],
+  glob: ["glob_pattern"],
   ignoreCase: ["ignore_case"],
   ignore_case: ["ignoreCase"],
   headLimit: ["head_limit", "limit"],
@@ -652,14 +654,16 @@ function defined(args: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-// Cursor's own prompt still says Shell / Read / Grep. Claude Code declares
-// Bash / Read / Write / Edit / Grep for every Claude model. Pi declares the
-// lowercase names. Map only when exactly one declared tool is in the group.
+// Cursor's own prompt still says Shell / Read / Grep. Callers declare different
+// names for the same capability: Claude Code uses Bash / Read / Write / Edit,
+// Pi uses the lowercase names, Codex uses exec_command, and Grok Build uses
+// run_terminal_command / read_file / search_replace / list_dir. Map only when
+// exactly one declared tool is in the group.
 const TOOL_NAME_GROUPS: string[][] = [
-  ["bash", "shell"],
-  ["read"],
-  ["write"],
-  ["edit", "strreplace", "str_replace"],
+  ["bash", "shell", "exec_command", "run_terminal_command", "run_terminal_cmd", "shell_command"],
+  ["read", "read_file"],
+  ["write", "write_file", "search_replace"],
+  ["edit", "strreplace", "str_replace", "search_replace"],
   ["grep"],
   ["glob", "find"],
   ["webfetch", "web_fetch"],
@@ -667,6 +671,160 @@ const TOOL_NAME_GROUPS: string[][] = [
   ["todowrite", "todo_write"],
   ["ls", "list_dir"],
 ];
+
+/**
+ * Translate one native exec into the tool name and arguments the caller declared.
+ * Codex declares exec_command and no Read/Edit/Write, so a native read or edit
+ * becomes one shell command. Grok Build and Claude Code declare the file tools,
+ * so those keep their structured arguments.
+ */
+export function presentCallerTool(
+  native: { name: string; aliases: string[]; args: Record<string, unknown> },
+  tools: McpToolDefinition[],
+): { name: string; args: Record<string, unknown> } {
+  const declared = new Set(tools.map((tool) => tool.name).filter((name) => name !== ""));
+  let name = resolveCallerToolName(declaredName(native.name, native.aliases, declared), declared);
+  let args = native.args;
+  if (name.toLowerCase() === "search_replace" && isFileWrite(args)) {
+    args = { path: args.path ?? args.file_path ?? args.filePath, old_string: "", new_string: args.content };
+  }
+  if (declared.size > 0 && !declared.has(name)) {
+    const shell = soleDeclared(declared, TOOL_NAME_GROUPS[0] ?? []);
+    const command = shell ? shellCommandFor(native.name, native.args) : undefined;
+    if (shell && command) {
+      name = shell;
+      args = { command };
+    }
+  }
+  return { name, args: alignCallerToolArgs(name, args, tools) };
+}
+
+function isFileWrite(args: Record<string, unknown>): boolean {
+  return (
+    typeof args.content === "string" &&
+    args.old_string === undefined &&
+    args.oldString === undefined &&
+    args.edits === undefined
+  );
+}
+
+function soleDeclared(declared: Set<string>, group: string[]): string | undefined {
+  const names = new Set(group);
+  const hits = [...declared].filter((name) => names.has(name.toLowerCase()));
+  return hits.length === 1 ? hits[0] : undefined;
+}
+
+function shellCommandFor(kind: string, args: Record<string, unknown>): string | undefined {
+  const name = kind.toLowerCase();
+  if (name === "bash" || name === "shell") {
+    const command = args.command ?? args.cmd;
+    return typeof command === "string" && command !== "" ? command : undefined;
+  }
+  if (name === "read") return readCommand(args);
+  if (name === "grep") return grepCommand(args);
+  if (name === "ls") return lsCommand(args);
+  if (name === "find" || name === "glob") return findCommand(args);
+  if (name === "write") return writeCommand(args);
+  if (name === "edit" || name === "strreplace" || name === "str_replace") return editCommand(args);
+  return undefined;
+}
+
+function shQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : undefined;
+}
+
+function readCommand(args: Record<string, unknown>): string | undefined {
+  const path = asString(args.path) ?? asString(args.file_path) ?? asString(args.filePath);
+  if (!path) return undefined;
+  const offset = asNumber(args.offset);
+  const limit = asNumber(args.limit);
+  if (offset === undefined && limit === undefined) return `cat -- ${shQuote(path)}`;
+  const start = Math.max(1, offset ?? 1);
+  const end = limit === undefined ? "$" : String(start + Math.max(limit, 0) - 1);
+  return `sed -n ${shQuote(`${start},${end}p`)} -- ${shQuote(path)}`;
+}
+
+function grepCommand(args: Record<string, unknown>): string | undefined {
+  const pattern = asString(args.pattern);
+  if (!pattern) return undefined;
+  const bits = ["rg", "-n"];
+  if (args.ignoreCase === true || args.ignore_case === true) bits.push("-i");
+  if (args.literal === true) bits.push("-F");
+  const context = asNumber(args.context);
+  if (context !== undefined && context > 0) bits.push("-C", String(context));
+  const glob = asString(args.glob) ?? asString(args.glob_pattern);
+  if (glob) bits.push("-g", shQuote(glob));
+  const limit = asNumber(args.limit) ?? asNumber(args.headLimit) ?? asNumber(args.head_limit);
+  if (limit !== undefined && limit > 0) bits.push("-m", String(limit));
+  bits.push("--", shQuote(pattern));
+  const path = asString(args.path);
+  if (path) bits.push(shQuote(path));
+  return bits.join(" ");
+}
+
+function lsCommand(args: Record<string, unknown>): string | undefined {
+  const path = asString(args.path) ?? ".";
+  let command = `ls -la -- ${shQuote(path)}`;
+  const limit = asNumber(args.limit);
+  if (limit !== undefined && limit > 0) command += ` | head -n ${limit}`;
+  return command;
+}
+
+function findCommand(args: Record<string, unknown>): string | undefined {
+  const pattern = asString(args.pattern);
+  if (!pattern) return undefined;
+  const path = asString(args.path) ?? ".";
+  return `rg --files -g ${shQuote(pattern)} -- ${shQuote(path)}`;
+}
+
+function writeCommand(args: Record<string, unknown>): string | undefined {
+  const path = asString(args.path) ?? asString(args.file_path) ?? asString(args.filePath);
+  if (!path || typeof args.content !== "string") return undefined;
+  return pythonPayload(
+    "import base64,json,pathlib,sys\np=json.loads(base64.b64decode(sys.argv[1]))\npath=pathlib.Path(p[\"path\"])\npath.parent.mkdir(parents=True, exist_ok=True)\npath.write_text(p.get(\"content\",\"\"))",
+    { path, content: args.content },
+  );
+}
+
+function editCommand(args: Record<string, unknown>): string | undefined {
+  const path = asString(args.path) ?? asString(args.file_path) ?? asString(args.filePath);
+  const edits = editPayloads(args);
+  if (!path || edits.length === 0) return undefined;
+  return pythonPayload(
+    "import base64,json,pathlib,sys\np=json.loads(base64.b64decode(sys.argv[1]))\npath=pathlib.Path(p[\"path\"])\ntext=path.read_text()\nfor e in p[\"edits\"]:\n    old=e[\"old\"]\n    new=e[\"new\"]\n    count=text.count(old)\n    if count==0:\n        raise SystemExit(\"old_string not found\")\n    if count>1 and not e.get(\"all\"):\n        raise SystemExit(\"old_string matched more than once\")\n    text=text.replace(old, new, 0 if e.get(\"all\") else 1)\npath.write_text(text)",
+    { path, edits },
+  );
+}
+
+function editPayloads(args: Record<string, unknown>): Array<{ old: string; new: string; all: boolean }> {
+  if (Array.isArray(args.edits)) {
+    return args.edits.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const edit = item as Record<string, unknown>;
+      const old = edit.oldText ?? edit.old_text ?? edit.oldString ?? edit.old_string;
+      const next = edit.newText ?? edit.new_text ?? edit.newString ?? edit.new_string;
+      if (typeof old !== "string" || typeof next !== "string") return [];
+      return [{ old, new: next, all: false }];
+    });
+  }
+  const old = args.oldText ?? args.old_text ?? args.oldString ?? args.old_string;
+  const next = args.newText ?? args.new_text ?? args.newString ?? args.new_string;
+  if (typeof old !== "string" || typeof next !== "string") return [];
+  return [{ old, new: next, all: args.replaceAll === true || args.replace_all === true }];
+}
+
+function pythonPayload(script: string, payload: unknown): string {
+  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+  return `python3 -c ${shQuote(script)} ${shQuote(encoded)}`;
+}
 
 export function resolveCallerToolName(raw: string, declared: Set<string>): string {
   if (!raw || declared.size === 0 || declared.has(raw)) return raw;

@@ -46,7 +46,10 @@ function list(name: string, fallback: string[]): string[] {
  * in the default. Cursor hides a native that is not listed, and Claude then
  * stops calling the matching caller tool. session.ts maps each of these back
  * onto the name and argument keys the caller declared: Claude Code's Read/Edit
- * (`file_path`, `old_string`) or Pi's read/edit (`path`, `edits`).
+ * (`file_path`, `old_string`), Pi's read/edit (`path`, `edits`), Codex's
+ * `exec_command` (`cmd`), or Grok Build's `read_file` / `search_replace` /
+ * `run_terminal_command` / `list_dir`. A caller that only declares a shell tool
+ * receives read, edit, and write as one shell command.
  *
  * Cursor's own `edit_tool_call` stays out. Its exec only carries a path and a
  * content stream, not the old/new text a caller tool needs. Pi's

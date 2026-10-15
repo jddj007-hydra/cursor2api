@@ -4,6 +4,7 @@ import { DEFAULT_ALLOWED_TOOLS } from "../src/config.js";
 import {
   alignCallerToolArgs,
   nativeToolCallFromExec,
+  presentCallerTool,
   resolveCallerToolName,
   type McpToolDefinition,
 } from "../src/cursor/session.js";
@@ -196,4 +197,89 @@ test("dynamic-tool handback is stripped", () => {
 
 test("request-context exec is not a caller tool", () => {
   assert.equal(nativeToolCallFromExec({ requestContextArgs: {} }), undefined);
+});
+
+function tool(name: string, properties: Record<string, unknown>, required: string[] = []): McpToolDefinition {
+  return {
+    name,
+    toolName: name,
+    providerIdentifier: "openai",
+    description: "",
+    inputSchemaJson: JSON.stringify({ type: "object", properties, required, additionalProperties: false }),
+  };
+}
+
+test("Codex exec_command and Grok run_terminal_command receive the shell command", () => {
+  const codex = [tool("exec_command", { cmd: { type: "string" }, workdir: { type: "string" } }, ["cmd"])];
+  const grok = [tool("run_terminal_command", { command: { type: "string" }, block_until_ms: { type: "number" } }, ["command"])];
+  const shell = nativeToolCallFromExec({ execId: "exec-1", shellArgs: { command: "ls" } });
+  assert.ok(shell);
+  assert.deepEqual(presentCallerTool(shell, codex), { name: "exec_command", args: { cmd: "ls" } });
+  assert.deepEqual(presentCallerTool(shell, grok), { name: "run_terminal_command", args: { command: "ls" } });
+  assert.equal(resolveCallerToolName("bash", new Set(["exec_command", "run_terminal_command"])), "bash");
+});
+
+test("Grok file tools keep structured arguments", () => {
+  const grok = [
+    tool("read_file", { target_file: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } }, ["target_file"]),
+    tool("search_replace", { file_path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } }, ["file_path", "old_string", "new_string"]),
+    tool("write", { file_path: { type: "string" }, content: { type: "string" } }, ["file_path", "content"]),
+    tool("list_dir", { target_directory: { type: "string" } }, ["target_directory"]),
+    tool("grep", { pattern: { type: "string" }, path: { type: "string" }, glob_pattern: { type: "string" } }, ["pattern"]),
+  ];
+  const read = nativeToolCallFromExec({ readArgs: { path: "src/a.ts", offset: 2, limit: 10 } });
+  const edit = nativeToolCallFromExec({ piEditArgs: { path: "src/a.ts", edits: [{ oldText: "foo", newText: "bar" }] } });
+  const write = nativeToolCallFromExec({ writeArgs: { path: "src/b.ts", fileText: "hello" } });
+  const ls = nativeToolCallFromExec({ lsArgs: { path: "/tmp" } });
+  const grep = nativeToolCallFromExec({ grepArgs: { pattern: "foo", path: "src", glob: "*.ts" } });
+  assert.ok(read && edit && write && ls && grep);
+  assert.deepEqual(presentCallerTool(read, grok), { name: "read_file", args: { target_file: "src/a.ts", offset: 2, limit: 10 } });
+  assert.deepEqual(presentCallerTool(edit, grok), {
+    name: "search_replace",
+    args: { file_path: "src/a.ts", old_string: "foo", new_string: "bar" },
+  });
+  assert.deepEqual(presentCallerTool(write, grok), { name: "write", args: { file_path: "src/b.ts", content: "hello" } });
+  assert.deepEqual(presentCallerTool(ls, grok), { name: "list_dir", args: { target_directory: "/tmp" } });
+  assert.deepEqual(presentCallerTool(grep, grok), { name: "grep", args: { pattern: "foo", path: "src", glob_pattern: "*.ts" } });
+});
+
+test("Grok read_file that already uses path is left alone", () => {
+  const read = nativeToolCallFromExec({ readArgs: { path: "src/main.rs" } });
+  assert.ok(read);
+  assert.deepEqual(presentCallerTool(read, [tool("read_file", { path: { type: "string" } }, ["path"])]), {
+    name: "read_file",
+    args: { path: "src/main.rs" },
+  });
+});
+
+test("a Grok toolset with only search_replace accepts a new file as an empty old_string", () => {
+  const write = nativeToolCallFromExec({ piWriteArgs: { path: "src/new.ts", content: "export {}" } });
+  assert.ok(write);
+  assert.deepEqual(
+    presentCallerTool(write, [
+      tool("search_replace", { file_path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" } }, ["file_path", "old_string", "new_string"]),
+    ]),
+    { name: "search_replace", args: { file_path: "src/new.ts", old_string: "", new_string: "export {}" } },
+  );
+});
+
+test("Codex file tools become one exec_command", () => {
+  const codex = [tool("exec_command", { cmd: { type: "string" } }, ["cmd"]), tool("write_stdin", { session_id: { type: "number" } })];
+  const read = nativeToolCallFromExec({ readArgs: { path: "src/a.ts", offset: 10, limit: 5 } });
+  const edit = nativeToolCallFromExec({ piEditArgs: { path: "src/a.ts", edits: [{ oldText: "foo", newText: "bar" }] } });
+  assert.ok(read && edit);
+  const readCall = presentCallerTool(read, codex);
+  assert.equal(readCall.name, "exec_command");
+  assert.equal(readCall.args.cmd, "sed -n '10,14p' -- 'src/a.ts'");
+  const editCall = presentCallerTool(edit, codex);
+  assert.equal(editCall.name, "exec_command");
+  assert.equal(typeof editCall.args.cmd, "string");
+  const command = String(editCall.args.cmd);
+  assert.match(command, /^python3 -c /);
+  const encoded = command.split(" ").at(-1)?.replaceAll("'", "");
+  assert.ok(encoded);
+  assert.deepEqual(JSON.parse(Buffer.from(encoded, "base64").toString("utf8")), {
+    path: "src/a.ts",
+    edits: [{ old: "foo", new: "bar", all: false }],
+  });
 });
